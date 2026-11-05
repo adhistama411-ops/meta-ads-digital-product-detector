@@ -55,7 +55,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.caption(
-    "Sumber: Meta Ads Library publik melalui Apify. "
+    "Sumber data: impor CSV/JSON, analisis landing page publik, dan Apify sebagai sumber tambahan. "
     "Data penjualan aktual kompetitor tidak tersedia."
 )
 
@@ -440,6 +440,7 @@ def normalize(item):
         "body": body,
         "start": str(start or ""),
         "days": days,
+        "days_available": bool(start or getv(item, "daysActive", "days_active", default=None) is not None),
         "platforms": platforms,
         "ad_link": str(ad_link or ""),
         "destination": str(destination or ""),
@@ -449,6 +450,7 @@ def normalize(item):
         "product": detect_product_name(title, body),
         "prices": detect_price(combined),
         "bonuses": detect_bonuses(combined),
+        "source": clean_text(getv(item, "source", "data_source", default="Impor / sumber eksternal")),
         "raw": item
     }
 
@@ -463,7 +465,9 @@ def score_product(ad):
 
     days = ad["days"]
 
-    if days >= 90:
+    if not ad.get("days_available", False):
+        reasons.append("Durasi iklan tidak tersedia; tidak diberi poin durasi")
+    elif days >= 90:
         score += 30
         reasons.append("Iklan terdeteksi aktif ≥90 hari")
     elif days >= 45:
@@ -523,6 +527,201 @@ def score_product(ad):
         reasons.append("Materi iklan cukup lengkap")
 
     return min(score, 100), reasons
+
+
+
+
+# =====================================================
+# 6B. PRODUCT INTELLIGENCE ENGINE
+# =====================================================
+
+import unicodedata
+from difflib import SequenceMatcher
+from collections import defaultdict
+from urllib.parse import urlparse, urljoin
+
+STOPWORDS_PRODUCT = {
+    "dan", "yang", "untuk", "dengan", "di", "ke", "dari", "the",
+    "official", "resmi", "terbaru", "promo", "diskon", "murah",
+    "limited", "edition", "produk", "digital", "beli", "sekarang"
+}
+
+def normalize_product_text(value):
+    value = unicodedata.normalize("NFKD", clean_text(value).lower())
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    value = re.sub(r"https?://\S+", " ", value)
+    value = re.sub(r"[^a-z0-9\s]", " ", value)
+    tokens = [t for t in value.split() if t not in STOPWORDS_PRODUCT and len(t) > 1]
+    return " ".join(tokens)
+
+def product_domain(url):
+    try:
+        host = (urlparse(url).hostname or "").lower()
+        return host[4:] if host.startswith("www.") else host
+    except Exception:
+        return ""
+
+def extract_price_values(price_list):
+    """Mengubah harga eksplisit menjadi angka IDR jika formatnya cukup jelas."""
+    values = []
+    for raw in price_list or []:
+        s = clean_text(raw).lower().replace("rp", "").replace("idr", "").strip()
+        s = s.replace(" ", "")
+        multiplier = 1
+        if s.endswith("rb"):
+            multiplier, s = 1000, s[:-2]
+        elif s.endswith("ribu"):
+            multiplier, s = 1000, s[:-4]
+        elif s.endswith("jt"):
+            multiplier, s = 1000000, s[:-2]
+        elif s.endswith("juta"):
+            multiplier, s = 1000000, s[:-4]
+        # Harga dengan pemisah ribuan: 99.000 / 99,000.
+        if re.fullmatch(r"\d{1,3}(?:[.,]\d{3})+", s):
+            number = int(re.sub(r"[.,]", "", s))
+        elif re.fullmatch(r"\d+(?:[.,]\d+)?", s):
+            number = float(s.replace(",", "."))
+        else:
+            continue
+        amount = int(number * multiplier)
+        if 100 <= amount <= 2_000_000_000:
+            values.append(amount)
+    return sorted(set(values))
+
+def build_product_groups(ad_list, similarity_threshold=0.84):
+    """
+    Mengelompokkan iklan yang kemungkinan mempromosikan produk sama.
+    Pengelompokan berbasis nama/judul, domain tujuan, dan kategori.
+    Ini indikasi kemiripan, bukan verifikasi identitas produk.
+    """
+    prepared = []
+    for idx, ad in enumerate(ad_list):
+        product = clean_text(ad.get("product", ""))
+        title = clean_text(ad.get("title", ""))
+        body = clean_text(ad.get("body", ""))
+        # Judul produk mendapat prioritas; teks iklan menjadi cadangan.
+        name_key = normalize_product_text(product if product and
+                    product != "Nama produk belum teridentifikasi"
+                    else title)
+        if len(name_key) < 3:
+            name_key = normalize_product_text(title + " " + body[:180])
+        domain = product_domain(ad.get("destination", ""))
+        prepared.append({
+            "index": idx,
+            "name": product or title or "Produk belum teridentifikasi",
+            "key": name_key,
+            "domain": domain,
+            "category": ad.get("category", "Belum teridentifikasi"),
+            "ad": ad
+        })
+
+    parent = list(range(len(prepared)))
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i in range(len(prepared)):
+        a = prepared[i]
+        if not a["key"]:
+            continue
+        for j in range(i + 1, len(prepared)):
+            b = prepared[j]
+            if not b["key"]:
+                continue
+            same_domain = bool(a["domain"] and a["domain"] == b["domain"])
+            same_key = a["key"] == b["key"]
+            similarity = SequenceMatcher(None, a["key"], b["key"]).ratio()
+            token_a, token_b = set(a["key"].split()), set(b["key"].split())
+            overlap = (len(token_a & token_b) / max(1, len(token_a | token_b)))
+            same_category = (
+                a["category"] == b["category"]
+                and a["category"] != "Belum teridentifikasi"
+            )
+            # Domain sama + kategori sejalan merupakan sinyal kuat.
+            match = same_key or (same_domain and (similarity >= 0.60 or overlap >= 0.50))
+            if not match and same_category and similarity >= similarity_threshold:
+                match = True
+            if not match and similarity >= 0.93 and overlap >= 0.75:
+                match = True
+            if match:
+                union(i, j)
+
+    buckets = defaultdict(list)
+    for i, item in enumerate(prepared):
+        buckets[find(i)].append(item)
+
+    groups = []
+    for members in buckets.values():
+        ads_in_group = [m["ad"] for m in members]
+        names = [m["name"] for m in members
+                 if m["name"] and m["name"] != "Nama produk belum teridentifikasi"]
+        # Nama terpanjang sering lebih informatif, tetapi tidak dianggap pasti.
+        display_name = max(names, key=len) if names else "Produk belum teridentifikasi"
+        categories = [m["category"] for m in members
+                      if m["category"] != "Belum teridentifikasi"]
+        category = max(set(categories), key=categories.count) if categories else "Belum teridentifikasi"
+        advertisers = sorted(set(
+            a.get("advertiser", "") for a in ads_in_group
+            if a.get("advertiser") and a.get("advertiser") != "Pengiklan tidak tersedia"
+        ))
+        domains = sorted(set(m["domain"] for m in members if m["domain"]))
+        prices = sorted(set(
+            price for a in ads_in_group
+            for price in extract_price_values(a.get("prices", []))
+        ))
+        all_price_text = list(dict.fromkeys(
+            p for a in ads_in_group for p in (a.get("prices") or [])
+        ))
+        scores = [int(a.get("score", 0) or 0) for a in ads_in_group]
+        days = [int(a.get("days", 0) or 0) for a in ads_in_group
+                if a.get("days_available", False)]
+        ad_links = list(dict.fromkeys(a.get("ad_link", "") for a in ads_in_group if a.get("ad_link")))
+        landing_pages = list(dict.fromkeys(a.get("destination", "") for a in ads_in_group if a.get("destination")))
+        bonuses = list(dict.fromkeys(
+            bonus for a in ads_in_group for bonus in (a.get("bonuses") or [])
+        ))
+        group_score = round(sum(scores) / len(scores)) if scores else 0
+        # Confidence is confidence in grouping only, not product quality or sales.
+        keys = [m["key"] for m in members if m["key"]]
+        exact_keys = len(set(keys)) <= 1
+        if len(members) == 1:
+            match_confidence = "Belum dibandingkan"
+        elif exact_keys:
+            match_confidence = "Tinggi"
+        else:
+            match_confidence = "Perlu ditinjau"
+        groups.append({
+            "product": display_name,
+            "category": category,
+            "ad_count": len(ads_in_group),
+            "advertiser_count": len(advertisers),
+            "advertisers": advertisers,
+            "domains": domains,
+            "prices_numeric": prices,
+            "prices_text": all_price_text,
+            "price_min": min(prices) if prices else None,
+            "price_max": max(prices) if prices else None,
+            "bonuses": bonuses,
+            "avg_signal_score": group_score,
+            "max_signal_score": max(scores) if scores else 0,
+            "max_observed_days": max(days) if days else None,
+            "days_observed_count": len(days),
+            "ad_links": ad_links,
+            "landing_pages": landing_pages,
+            "match_confidence": match_confidence,
+            "ads": ads_in_group
+        })
+
+    return sorted(groups, key=lambda g: (g["avg_signal_score"], g["ad_count"]), reverse=True)
+
+def format_idr(value):
+    return "Rp" + f"{int(value):,}".replace(",", ".") if value is not None else "Tidak terdeteksi"
 
 
 # =====================================================
@@ -710,6 +909,9 @@ if "query_url" not in st.session_state:
 if "page_results" not in st.session_state:
     st.session_state.page_results = {}
 
+if "manual_page_result" not in st.session_state:
+    st.session_state.manual_page_result = None
+
 
 # =====================================================
 # 9. PENCARIAN APIFY
@@ -743,7 +945,10 @@ if search_btn:
         st.error("Masukkan kata kunci.")
 
     elif not apify_token:
-        st.warning("Masukkan Apify API Token terlebih dahulu.")
+        st.warning(
+            "Apify tidak dikonfigurasi. Anda tetap bisa melakukan riset melalui "
+            "impor CSV/JSON dan Landing Page Analyzer di bawah."
+        )
 
     else:
         url = make_meta_url(
@@ -841,7 +1046,7 @@ st.divider()
 st.subheader("📥 Impor hasil riset")
 
 uploaded = st.file_uploader(
-    "Unggah hasil CSV atau JSON dari Apify",
+    "Unggah data iklan CSV atau JSON dari Apify, Meta Ads Library, atau sumber Anda sendiri",
     type=["csv", "json"]
 )
 
@@ -854,8 +1059,10 @@ if uploaded:
             if isinstance(raw, dict):
                 raw = raw.get(
                     "data",
-                    raw.get("items", [raw])
+                    raw.get("items", raw.get("ads", [raw]))
                 )
+                if isinstance(raw, dict):
+                    raw = [raw]
 
         else:
             raw = list(csv.DictReader(
@@ -863,6 +1070,9 @@ if uploaded:
                     uploaded.getvalue().decode("utf-8-sig")
                 )
             ))
+
+        if not isinstance(raw, list):
+            raise ValueError("Data harus berupa daftar/baris iklan.")
 
         imported = [
             normalize(item)
@@ -885,7 +1095,48 @@ if uploaded:
 
 
 # =====================================================
-# 11. DASHBOARD HASIL
+# 11. ANALISIS LANDING PAGE MANDIRI (TANPA APIFY)
+# =====================================================
+
+st.divider()
+st.subheader("🌐 Landing Page Analyzer — Mandiri")
+st.caption(
+    "Masukkan URL halaman penjualan publik untuk mendeteksi judul, deskripsi, "
+    "kategori, harga, bonus, dan tautan checkout. Fitur ini tidak menggunakan Apify."
+)
+manual_url = st.text_input(
+    "URL landing page", key="manual_landing_url",
+    placeholder="https://contoh.com/halaman-penjualan"
+)
+if st.button("Analisis Landing Page", key="analyze_manual_page", type="primary"):
+    if not manual_url.strip():
+        st.warning("Masukkan URL landing page terlebih dahulu.")
+    else:
+        with st.spinner("Membaca halaman publik..."):
+            st.session_state.manual_page_result = analyze_landing_page(manual_url.strip())
+
+if st.session_state.get("manual_page_result"):
+    result = st.session_state.manual_page_result
+    if result.get("error"):
+        st.error(result["error"])
+    else:
+        st.success("Halaman berhasil dianalisis.")
+        st.write("**Judul:**", result.get("title") or "Tidak tersedia")
+        st.write("**Deskripsi:**", result.get("description") or "Tidak tersedia")
+        st.write("**Kategori:**", result.get("category") or "Belum teridentifikasi")
+        st.write("**Harga terdeteksi:**", ", ".join(result.get("prices", [])) or "Tidak terdeteksi")
+        st.write("**Bonus terdeteksi:**", ", ".join(result.get("bonuses", [])) or "Tidak terdeteksi")
+        st.write("**Link checkout:**")
+        if result.get("checkout_links"):
+            for link in result["checkout_links"]:
+                st.markdown(f"- [{link}]({link})")
+        else:
+            st.write("Belum ditemukan dari tautan HTML yang terbaca.")
+        st.caption("Sumber: HTML halaman publik yang berhasil diakses; bukan verifikasi transaksi atau penjualan.")
+
+
+# =====================================================
+# 12. DASHBOARD HASIL
 # =====================================================
 
 ads = st.session_state.ads
@@ -937,8 +1188,111 @@ if ads:
         "Ini merupakan indikator aktivitas, bukan bukti penjualan."
     )
 
+    # =================================================
+    # PRODUCT INTELLIGENCE: PENGELOMPOKAN PRODUK
+    # =================================================
+    product_groups = build_product_groups(ads)
     st.divider()
-    st.subheader("🛍️ Hasil riset produk")
+    st.subheader("🧠 Product Intelligence")
+    st.caption(
+        "Iklan dikelompokkan berdasarkan kemiripan nama/judul, kategori, dan domain landing page. "
+        "Pengelompokan adalah indikasi otomatis dan perlu pemeriksaan manual."
+    )
+
+    pi1, pi2, pi3, pi4 = st.columns(4)
+    pi1.metric("Kelompok produk", len(product_groups))
+    pi2.metric("Produk dengan >1 iklan", sum(1 for g in product_groups if g["ad_count"] > 1))
+    pi3.metric("Pengiklan teridentifikasi", len(set(
+        name for g in product_groups for name in g["advertisers"]
+    )))
+    pi4.metric("Kelompok perlu ditinjau", sum(
+        1 for g in product_groups if g["match_confidence"] == "Perlu ditinjau"
+    ))
+
+    min_ads_filter = st.selectbox(
+        "Filter jumlah iklan per kelompok",
+        ["Semua", "Minimal 2 iklan", "Minimal 3 iklan"],
+        key="pi_min_ads"
+    )
+    visible_groups = product_groups
+    if min_ads_filter == "Minimal 2 iklan":
+        visible_groups = [g for g in product_groups if g["ad_count"] >= 2]
+    elif min_ads_filter == "Minimal 3 iklan":
+        visible_groups = [g for g in product_groups if g["ad_count"] >= 3]
+
+    for gi, group in enumerate(visible_groups):
+        with st.container(border=True):
+            header_cols = st.columns([4, 1, 1])
+            header_cols[0].markdown(f"**{group['product']}**")
+            header_cols[0].caption(
+                f"{group['category']} · Pengelompokan: {group['match_confidence']}"
+            )
+            header_cols[1].metric("Jumlah iklan", group["ad_count"])
+            header_cols[2].metric("Skor sinyal rata-rata", f"{group['avg_signal_score']}/100")
+
+            details = st.columns(3)
+            details[0].write("**Pengiklan**")
+            details[0].write(", ".join(group["advertisers"]) or "Tidak tersedia")
+            details[1].write("**Rentang harga terdeteksi**")
+            if group["price_min"] is not None:
+                details[1].write(
+                    f"{format_idr(group['price_min'])} – {format_idr(group['price_max'])}"
+                )
+            else:
+                details[1].write("Tidak ditemukan harga numerik yang dapat dibaca")
+            details[2].write("**Durasi terlama teramati**")
+            details[2].write(
+                f"{group['max_observed_days']} hari"
+                if group["max_observed_days"] is not None else "Tidak tersedia"
+            )
+
+            with st.expander("Rincian bukti dan iklan dalam kelompok"):
+                st.write("**Teks harga yang ditemukan:**", ", ".join(group["prices_text"]) or "Tidak ada")
+                st.write("**Bonus/penawaran yang terdeteksi:**", ", ".join(group["bonuses"]) or "Tidak ada")
+                st.write("**Domain landing page:**", ", ".join(group["domains"]) or "Tidak tersedia")
+                st.write("**Catatan:** skor sinyal adalah prioritas pemeriksaan berdasarkan data iklan, bukan estimasi penjualan atau profit.")
+                for ad_no, member_ad in enumerate(group["ads"], start=1):
+                    st.markdown(f"**Iklan {ad_no}:** {member_ad.get('advertiser', 'Pengiklan tidak tersedia')}")
+                    st.caption(member_ad.get("title") or member_ad.get("body", "")[:240] or "Materi iklan tidak tersedia")
+                    if member_ad.get("ad_link"):
+                        st.markdown(f"[Lihat iklan]({member_ad['ad_link']})")
+                    if member_ad.get("destination"):
+                        st.markdown(f"[Landing page]({member_ad['destination']})")
+
+    # Product-level CSV export
+    product_export = []
+    for group in product_groups:
+        product_export.append({
+            "product": group["product"],
+            "category": group["category"],
+            "ad_count": group["ad_count"],
+            "advertiser_count": group["advertiser_count"],
+            "advertisers": " | ".join(group["advertisers"]),
+            "match_confidence": group["match_confidence"],
+            "average_signal_score": group["avg_signal_score"],
+            "max_observed_days": group["max_observed_days"],
+            "price_min_idr": group["price_min"],
+            "price_max_idr": group["price_max"],
+            "observed_price_text": " | ".join(group["prices_text"]),
+            "bonuses": " | ".join(group["bonuses"]),
+            "landing_pages": " | ".join(group["landing_pages"]),
+            "ad_links": " | ".join(group["ad_links"])
+        })
+    if product_export:
+        pi_csv = io.StringIO()
+        pi_writer = csv.DictWriter(pi_csv, fieldnames=list(product_export[0].keys()))
+        pi_writer.writeheader()
+        pi_writer.writerows(product_export)
+        st.download_button(
+            "⬇️ Ekspor Product Intelligence (CSV)",
+            data=pi_csv.getvalue(),
+            file_name="product_intelligence.csv",
+            mime="text/csv",
+            key="download_product_intelligence"
+        )
+
+    st.divider()
+    st.subheader("🛍️ Detail iklan sumber")
 
     for index, ad in enumerate(ads):
 
@@ -978,7 +1332,10 @@ if ads:
             )
 
             c.write("**Durasi iklan**")
-            c.write(f"{ad['days']} hari")
+            c.write(
+                f"{ad['days']} hari" if ad.get("days_available", False)
+                else "Tidak tersedia"
+            )
 
             st.write("**Bonus / penawaran**")
 
@@ -1077,7 +1434,7 @@ if ads:
                             )
 
     # =================================================
-    # 12. EKSPOR
+    # 13. EKSPOR
     # =================================================
 
     export = []
@@ -1090,7 +1447,8 @@ if ads:
             "category": ad["category"],
             "prices": ad["prices"],
             "bonuses": ad["bonuses"],
-            "days_active": ad["days"],
+            "days_active": ad["days"] if ad.get("days_available", False) else None,
+        "source": ad.get("source", "Impor / sumber eksternal"),
             "score": ad["score"],
             "landing_page": ad["destination"],
             "ad_library": ad["ad_link"],
@@ -1108,6 +1466,25 @@ if ads:
         ),
         file_name="product_research.json",
         mime="application/json"
+    )
+
+    csv_buffer = io.StringIO()
+    csv_writer = csv.DictWriter(
+        csv_buffer,
+        fieldnames=list(export[0].keys()) if export else []
+    )
+    if export:
+        csv_writer.writeheader()
+        for row in export:
+            csv_writer.writerow({
+                key: json.dumps(value, ensure_ascii=False) if isinstance(value, (list, dict)) else value
+                for key, value in row.items()
+            })
+    st.download_button(
+        "⬇️ UNDUH HASIL RISET CSV",
+        data=csv_buffer.getvalue(),
+        file_name="product_research.csv",
+        mime="text/csv"
     )
 
 else:
@@ -1130,13 +1507,13 @@ else:
     """)
 
 # =====================================================
-# 13. INFORMASI DAN BATASAN
+# 14. INFORMASI DAN BATASAN
 # =====================================================
 
 with st.expander("ℹ️ Informasi dan keterbatasan aplikasi"):
 
     st.markdown("""
-    1. Data iklan berasal dari Meta Ads Library melalui actor pihak ketiga Apify.
+    1. Data iklan dapat berasal dari impor CSV/JSON milik pengguna; Apify hanya sumber tambahan.
     2. Hasil tergantung ketersediaan data dan kemampuan actor.
     3. Tidak semua iklan memiliki informasi harga atau landing page.
     4. Analisis landing page membaca HTML yang dapat diakses secara publik.
@@ -1145,4 +1522,9 @@ with st.expander("ℹ️ Informasi dan keterbatasan aplikasi"):
     7. Skor merupakan prioritas riset berdasarkan indikator yang ditemukan.
     8. Skor bukan bukti penjualan, omzet, ROAS, atau keuntungan.
     9. Pastikan penggunaan Apify dan pengambilan data sesuai ketentuan penyedia.
+    10. Landing Page Analyzer bekerja tanpa Apify, tetapi hanya membaca HTML publik yang dapat diakses.
+    11. Harga dan bonus yang terdeteksi adalah teks yang ditemukan pada halaman, bukan konfirmasi harga checkout akhir.
+    12. Product Intelligence mengelompokkan iklan berdasarkan kemiripan nama/judul, kategori, dan domain; hasilnya bukan kepastian bahwa produknya identik.
+    13. Rentang harga hanya dihitung dari pola harga yang berhasil diparse sebagai angka; teks harga asli tetap disimpan sebagai bukti.
+    14. Skor kelompok adalah rata-rata skor sinyal iklan dalam kelompok, bukan prediksi omzet, penjualan, ROAS, atau profit.
     """)
